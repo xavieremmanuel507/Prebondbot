@@ -3,6 +3,7 @@
   "version": "1.0.0",
   "description": "pump.fun pre-bond token scanner Telegram bot",
   "main": "index.js",
+  "type": "module",
   "scripts": {
     "start": "node index.js",
     "dev": "node --watch index.js"
