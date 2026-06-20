@@ -13,17 +13,17 @@ if (!BOT_TOKEN || !CHAT_ID) {
 }
 
 const bot = new Bot(BOT_TOKEN);
-const seenMints = new Set();
-let foundTotal  = 0;
+let foundTotal = 0;
 const BOND_TARGET = 793_100_000_000;
 
-// Fetch full token details — try pump.fun first, fallback to mirror
+// Watchlist: mint => { symbol, name, seenAt, checked2h, checked24h }
+const watchlist = new Map();
+
 async function fetchTokenDetails(mint) {
   const endpoints = [
     `https://frontend-api.pump.fun/coins/${mint}`,
     `https://client-api-2-74b1891ee9f9.herokuapp.com/coins/${mint}`,
   ];
-
   for (const url of endpoints) {
     try {
       const res = await fetch(url, {
@@ -37,20 +37,14 @@ async function fetchTokenDetails(mint) {
       });
       if (!res.ok) continue;
       const data = await res.json();
-      if (data && data.mint) {
-        console.log(`📡 Fetched from: ${url.includes("heroku") ? "mirror" : "pump.fun"}`);
-        return data;
-      }
-    } catch (e) {
-      console.log(`⚠️ Failed ${url}: ${e.message}`);
-    }
+      if (data && data.mint) return data;
+    } catch (e) {}
   }
   return null;
 }
 
 function getBondPct(token) {
-  if (!token.vSolInBondingCurve && !token.virtual_sol_reserves) return 0;
-  const val = token.vSolInBondingCurve || token.virtual_sol_reserves;
+  const val = token.vSolInBondingCurve || token.virtual_sol_reserves || 0;
   return Math.min(100, (val / BOND_TARGET) * 100);
 }
 
@@ -83,15 +77,21 @@ function escMd(str = "") {
   return str.replace(/[_*[\]()~`>#+\-=|{}.!\\]/g, "\\$&");
 }
 
-async function sendAlert(t) {
-  const pct     = getBondPct(t);
-  const pumpUrl = `https://pump.fun/coin/${t.mint}`;
+function hasSocials(token) {
+  return (token.telegram && token.telegram.trim().length > 0) ||
+         (token.discord  && token.discord.trim().length  > 0) ||
+         (token.website  && token.website.trim().length  > 0);
+}
+
+async function sendAlert(t, checkLabel) {
+  const pct        = getBondPct(t);
+  const pumpUrl    = `https://pump.fun/coin/${t.mint}`;
   const tgUrl      = t.telegram ? cleanUrl(t.telegram) : null;
   const discordUrl = t.discord  ? cleanUrl(t.discord)  : null;
   const webUrl     = t.website  ? cleanUrl(t.website)  : null;
 
   const lines = [
-    `🔭 *New PreBond Token Spotted*`,
+    `🔭 *PreBond Token — ${escMd(checkLabel)} Check*`,
     ``,
     `🪙 *${escMd(t.name)}* — \`$${escMd(t.symbol)}\``,
     ``,
@@ -121,7 +121,7 @@ async function sendAlert(t) {
       disable_web_page_preview: true,
     });
     foundTotal++;
-    console.log(`✅ Alert sent: ${t.symbol} | TG: ${!!tgUrl} | Discord: ${!!discordUrl} | Web: ${!!webUrl}`);
+    console.log(`✅ Alert sent [${checkLabel}]: ${t.symbol}`);
   } catch (err) {
     console.error(`❌ Alert failed for ${t.mint}:`, err.message);
   }
@@ -131,44 +131,68 @@ function sleep(ms) {
   return new Promise(res => setTimeout(res, ms));
 }
 
-// Queue to avoid hammering the API
-const queue = [];
-let processing = false;
+async function runChecks() {
+  const now = Date.now();
+  const TWO_HOURS    = 2  * 60 * 60 * 1000;
+  const TWENTY_FOUR  = 24 * 60 * 60 * 1000;
+  const TWENTY_FIVE  = 25 * 60 * 60 * 1000;
 
-async function processQueue() {
-  if (processing) return;
-  processing = true;
+  const toCheck = [];
 
-  while (queue.length > 0) {
-    const mint = queue.shift();
-    try {
-      // Wait 1s between fetches to be respectful
-      await sleep(1000);
+  for (const [mint, entry] of watchlist.entries()) {
+    const age = now - entry.seenAt;
 
-      const token = await fetchTokenDetails(mint);
-      if (!token) {
-        console.log(`⚠️ Could not fetch details for ${mint}`);
-        continue;
-      }
+    // Clean up tokens older than 25 hours
+    if (age > TWENTY_FIVE) {
+      watchlist.delete(mint);
+      continue;
+    }
 
-      const bonded   = token.complete === true || token.raydium_pool != null;
-      const hasSocial = (token.telegram && token.telegram.trim().length > 0) ||
-                        (token.discord  && token.discord.trim().length  > 0) ||
-                        (token.website  && token.website.trim().length  > 0);
-      const pct      = getBondPct(token);
+    // 2 hour check
+    if (!entry.checked2h && age >= TWO_HOURS) {
+      toCheck.push({ mint, label: "2hr" });
+      continue;
+    }
 
-      console.log(`👀 ${token.symbol} | TG: ${token.telegram || "—"} | Discord: ${token.discord || "—"} | Web: ${token.website || "—"} | Bond: ${pct.toFixed(1)}%`);
-
-      if (bonded || !hasSocial || pct < MIN_BOND_PCT || pct > MAX_BOND_PCT) return;
-
-      await sendAlert(token);
-
-    } catch (e) {
-      console.error(`Queue error for ${mint}:`, e.message);
+    // 24 hour check
+    if (!entry.checked24h && age >= TWENTY_FOUR) {
+      toCheck.push({ mint, label: "24hr" });
     }
   }
 
-  processing = false;
+  console.log(`⏰ Running checks — ${toCheck.length} tokens due | Watchlist: ${watchlist.size}`);
+
+  for (const { mint, label } of toCheck) {
+    await sleep(1200);
+    const token = await fetchTokenDetails(mint);
+
+    if (!token) {
+      console.log(`⚠️ Could not fetch ${mint}`);
+      if (label === "2hr")  watchlist.get(mint) && (watchlist.get(mint).checked2h  = true);
+      if (label === "24hr") watchlist.get(mint) && (watchlist.get(mint).checked24h = true);
+      continue;
+    }
+
+    // Mark as checked
+    const entry = watchlist.get(mint);
+    if (entry) {
+      if (label === "2hr")  entry.checked2h  = true;
+      if (label === "24hr") entry.checked24h = true;
+    }
+
+    const bonded = token.complete === true || token.raydium_pool != null;
+    const pct    = getBondPct(token);
+
+    console.log(`[${label}] ${token.symbol} | Bonded: ${bonded} | Socials: ${hasSocials(token)} | Bond: ${pct.toFixed(1)}%`);
+
+    // Skip if already bonded or outside bond range
+    if (bonded || pct < MIN_BOND_PCT || pct > MAX_BOND_PCT) continue;
+
+    // Alert if has socials
+    if (hasSocials(token)) {
+      await sendAlert(token, label === "2hr" ? "2 Hour" : "24 Hour");
+    }
+  }
 }
 
 function connectWebSocket() {
@@ -190,13 +214,17 @@ function connectWebSocket() {
     try {
       const token = JSON.parse(data.toString());
       if (!token.mint) return;
-      if (seenMints.has(token.mint)) return;
-      seenMints.add(token.mint);
+      if (watchlist.has(token.mint)) return;
 
-      console.log(`🆕 New token detected: ${token.symbol} — queuing fetch...`);
-      queue.push(token.mint);
-      processQueue();
+      watchlist.set(token.mint, {
+        symbol:     token.symbol,
+        name:       token.name,
+        seenAt:     Date.now(),
+        checked2h:  false,
+        checked24h: false,
+      });
 
+      console.log(`➕ Watching: ${token.symbol} | Watchlist: ${watchlist.size}`);
     } catch (e) {}
   });
 
@@ -213,9 +241,10 @@ function connectWebSocket() {
 bot.command("start", async (ctx) => {
   await ctx.reply(
     "👋 *PreBond Scanner Bot*\n\n" +
-    "I watch pump\\.fun in real\\-time and alert you to new unbonded tokens with Telegram, Discord or Website\\.\n\n" +
+    "I watch every new pump\\.fun token and check them at *2 hours* and *24 hours*\\.\n\n" +
+    "If they're still unbonded and have Telegram, Discord or Website — I alert you\\.\n\n" +
     "/status \\— show stats\n" +
-    "/config \\— show filter settings",
+    "/config \\— show settings",
     { parse_mode: "MarkdownV2" }
   );
 });
@@ -224,9 +253,8 @@ bot.command("status", async (ctx) => {
   await ctx.reply(
     `📊 *Scanner Status*\n\n` +
     `✅ Running via PumpPortal\n` +
-    `📢 Alerts sent: \`${foundTotal}\`\n` +
-    `🧠 Tokens seen: \`${seenMints.size}\`\n` +
-    `📬 Queue: \`${queue.length}\``,
+    `👁 Watching: \`${watchlist.size}\` tokens\n` +
+    `📢 Alerts sent: \`${foundTotal}\``,
     { parse_mode: "MarkdownV2" }
   );
 });
@@ -234,7 +262,8 @@ bot.command("status", async (ctx) => {
 bot.command("config", async (ctx) => {
   await ctx.reply(
     `⚙️ *Current Config*\n\n` +
-    `Bond range: \`${MIN_BOND_PCT}% – ${MAX_BOND_PCT}%\``,
+    `Bond range: \`${MIN_BOND_PCT}% – ${MAX_BOND_PCT}%\`\n` +
+    `Checks: \`2 hours + 24 hours after launch\``,
     { parse_mode: "MarkdownV2" }
   );
 });
@@ -249,6 +278,12 @@ async function main() {
 
   await sleep(2000);
   connectWebSocket();
+
+  // Run checks every 10 minutes
+  setInterval(runChecks, 10 * 60 * 1000);
+
+  // First check after 5 minutes
+  setTimeout(runChecks, 5 * 60 * 1000);
 }
 
 main().catch(err => {
